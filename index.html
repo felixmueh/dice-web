@@ -8,19 +8,14 @@
       name="description"
       content="Run the dice language directly in the browser with Pyodide."
     />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap"
-      rel="stylesheet"
-    />
+    <link rel="stylesheet" href="./vendor/fonts/fonts.css" />
     <link rel="stylesheet" href="./styles/app.css" />
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
         <div class="topbar-brand">dice-web</div>
-        <a class="topbar-link" href="https://github.com/Mo0dy/dice" target="_blank" rel="noreferrer">
+        <a class="topbar-link" href="https://github.com/felixmueh/dice" target="_blank" rel="noreferrer">
           Documentation
         </a>
         <div class="topbar-meta">Ctrl/Command+Enter runs the active file</div>
@@ -118,6 +113,11 @@
           </article>
         </section>
       </main>
+
+      <!--
+        TODO: footer link to Impressum/Datenschutz on felix-muehlenberend.de.
+        Left out until that site is live; the link is part of its launch ticket.
+      -->
     </div>
 
     <dialog id="sample-dialog" class="sample-dialog">
@@ -137,12 +137,9 @@
       </form>
     </dialog>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ace.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script
-      src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ext-language_tools.min.js"
-      crossorigin="anonymous"
-      referrerpolicy="no-referrer"
-    ></script>
+    <!-- Ace 1.32.6 (ace-builds src-min); it loads the theme from the same folder. -->
+    <script src="./vendor/ace/ace.js"></script>
+    <script src="./vendor/ace/ext-language_tools.js"></script>
     <script src="./vendor/d3.min.js"></script>
     <script src="./vendor/observable-plot.umd.min.js"></script>
     <script type="module" src="./src/main.js"></script>

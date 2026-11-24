@@ -288,20 +288,15 @@ export async function installAppMocks(page, options = {}) {
   const responses = mergeResponses(options.responses);
   const useAce = options.ace === "fake";
 
-  await page.route("https://fonts.googleapis.com/**", async (route) => {
-    await route.fulfill({ status: 204, body: "" });
-  });
-  await page.route("https://fonts.gstatic.com/**", async (route) => {
-    await route.fulfill({ status: 204, body: "" });
-  });
-  await page.route("https://cdnjs.cloudflare.com/ajax/libs/ace/**/ace.js", async (route) => {
+  // Fonts are self-hosted under vendor/fonts/ and need no mock.
+  await page.route("**/vendor/ace/ace.js", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/javascript",
       body: useAce ? FAKE_ACE_SCRIPT : EMPTY_SCRIPT,
     });
   });
-  await page.route("https://cdnjs.cloudflare.com/ajax/libs/ace/**/ext-language_tools.min.js", async (route) => {
+  await page.route("**/vendor/ace/ext-language_tools.js", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/javascript",

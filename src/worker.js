@@ -1,4 +1,8 @@
-const PYODIDE_BASE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
+// Pyodide 0.26.4 is self-hosted under vendor/pyodide/ so the site makes no
+// requests to a CDN (see README.md). There is intentionally no CDN fallback:
+// if the local files are missing, booting fails loudly instead of quietly
+// sending the visitor's IP to a third party.
+const PYODIDE_BASE_URL = new URL("../vendor/pyodide/", self.location).toString();
 
 let bootPromise = null;
 let pyodide = null;
