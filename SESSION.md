@@ -12,11 +12,3 @@
   `dice` submodule checked out, so it cannot run in a fresh worktree without
   `git submodule update --init`.
 - No favicon: every page load logs a 404 for `/favicon.ico`.
-- Since dice 42c2eb8, unswept results are a bare `Distribution` instead of a
-  one-cell `Distributions`. `webbridge._format_result_text` and
-  `_serialize_result` only handle `Distributions`, so with the dice submodule
-  at a1a11d8 (package layout) `d6` shows `Distribution(entries=...)` in the
-  text panel and `result.type` is "distribution"; charts still render.
-  `tests.test_webbridge` fails 2 of 20 for this reason (also with dice
-  9704d6a in the old flat layout). The e2e tests mock the worker and do not
-  catch it.

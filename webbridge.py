@@ -237,7 +237,21 @@ def _format_scalar_heatmap(result, roundlevel=0):
     return _string_table(rows)
 
 
+def _as_distributions(result):
+    """Wrap a bare `Distribution` in a one-cell `Distributions`.
+
+    dice used to return every unswept result as a one-cell `Distributions`;
+    newer dice returns a bare `Distribution`. The browser payload and text
+    output keep the old one-cell shape, so the frontend and saved outputs see
+    no difference.
+    """
+    if isinstance(result, Distribution):
+        return Distributions.scalar(result)
+    return result
+
+
 def _format_result_text(result, roundlevel=0, probability_mode="percent"):
+    result = _as_distributions(result)
     if isinstance(result, Distributions):
         only_cell = next(iter(result.cells.values()))
         if result.is_unswept() and isinstance(only_cell, FiniteMeasure) and not isinstance(only_cell, Distribution):
@@ -291,6 +305,7 @@ def _serialize_measure(measure, *, roundlevel=0):
 
 
 def _serialize_result(result, *, roundlevel=0, probability_mode="raw"):
+    result = _as_distributions(result)
     if isinstance(result, Distributions):
         distribution_only = all(isinstance(distrib, Distribution) for distrib in result.cells.values())
         axes = [
@@ -347,15 +362,6 @@ def _serialize_result(result, *, roundlevel=0, probability_mode="raw"):
             "type": "distributions" if distribution_only else "sweep",
             "axes": axes,
             "cells": cells,
-        }
-    if isinstance(result, Distribution):
-        return {
-            "type": "distribution",
-            "distribution": _serialize_distribution(
-                result,
-                roundlevel=roundlevel,
-                probability_mode=probability_mode,
-            ),
         }
     if isinstance(result, FiniteMeasure):
         return {"type": "measure", "measure": _serialize_measure(result, roundlevel=roundlevel)}

@@ -22,6 +22,37 @@ class WebBridgeTest(unittest.TestCase):
         probabilities = [entry["probability"] for entry in payload["result"]["cells"][0]["distribution"]]
         self.assertEqual(probabilities, [round(1 / 6, 4)] * 6)
 
+    def test_bare_distribution_results_keep_the_one_cell_shape(self):
+        # Newer dice returns unswept results as a bare Distribution; the bridge
+        # must still emit the one-cell `distributions` payload and table text.
+        expected_text = {
+            "d6": "  1: 16.666667%\n  2: 16.666667%\n  3: 16.666667%\n"
+            "  4: 16.666667%\n  5: 16.666667%\n  6: 16.666667%\n(E): 3.500000",
+            "d20 >= 15": "  0: 70%\n  1: 30%\n(E): 0.300000",
+            "4d6h3 $ mean": "12.244599",
+        }
+        for source, text in expected_text.items():
+            with self.subTest(source=source):
+                payload = webbridge.evaluate(source, settings={"roundlevel": 6})
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["text"], text)
+                self.assertEqual(payload["result"]["type"], "distributions")
+                self.assertEqual(payload["result"]["axes"], [])
+                self.assertEqual(len(payload["result"]["cells"]), 1)
+                self.assertEqual(payload["result"]["cells"][0]["coordinates"], [])
+
+    def test_serialize_result_wraps_bare_distribution(self):
+        distribution = webbridge.Distribution({0: 0.7, 1: 0.3})
+        serialized = webbridge._serialize_result(distribution, roundlevel=6)
+        self.assertEqual(serialized["type"], "distributions")
+        self.assertEqual(
+            serialized["cells"],
+            [{"coordinates": [], "distribution": [
+                {"outcome": 0, "probability": 0.7},
+                {"outcome": 1, "probability": 0.3},
+            ]}],
+        )
+
     def test_evaluate_returns_structured_error(self):
         payload = webbridge.evaluate("1 / 0")
         self.assertFalse(payload["ok"])
