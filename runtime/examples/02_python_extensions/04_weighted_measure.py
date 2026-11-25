@@ -1,5 +1,4 @@
-from dice import dice_interpreter, dicefunction
-from diceengine import FiniteMeasure
+from dice import FiniteMeasure, dice_interpreter, dicefunction
 
 
 def build_result():

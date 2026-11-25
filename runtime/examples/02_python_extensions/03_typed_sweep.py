@@ -1,5 +1,4 @@
-from dice import dice_interpreter, dicefunction
-from diceengine import Distribution, Sweep
+from dice import Distribution, Sweep, dice_interpreter, dicefunction
 
 
 def build_result():

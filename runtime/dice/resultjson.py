@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 
-from diceengine import (
+from .diceengine import (
     Distributions,
     Distribution,
     FiniteMeasure,

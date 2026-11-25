@@ -7,31 +7,46 @@ RUNTIME_DIR="$ROOT_DIR/runtime"
 BRIDGE_SOURCE="$ROOT_DIR/webbridge.py"
 VIEWER_SOURCE="$ROOT_DIR/viewer.py"
 
-RUNTIME_FILES=(
-  dice.py
+# The dice runtime is the `dice` package inside the submodule (dice/dice/).
+# The browser gets a copy of that package at runtime/dice/, so webbridge.py
+# (runtime/webbridge.py) imports it as `dice.*` exactly as in a checkout.
+PACKAGE_SOURCE_DIR="$SOURCE_DIR/dice"
+PACKAGE_RUNTIME_DIR="$RUNTIME_DIR/dice"
+
+# Modules the browser needs. Deliberately left out: viewer.py (matplotlib,
+# replaced by the repo-local shim below), directdiceengine.py (sampling
+# reference engine used only by dice's tests) and __main__.py (CLI entry).
+PACKAGE_FILES=(
+  __init__.py
+  cli.py
   diagnostics.py
   diceengine.py
   diceparser.py
   executor.py
+  hostfunctions.py
   interpreter.py
   jsonrenderer.py
   lexer.py
+  purity.py
   renderplan.py
   resultjson.py
   syntaxtree.py
 )
 
 rm -rf "$RUNTIME_DIR"
-mkdir -p "$RUNTIME_DIR/stdlib" "$RUNTIME_DIR/examples"
+mkdir -p "$PACKAGE_RUNTIME_DIR/stdlib" "$RUNTIME_DIR/examples"
 
-for relative_path in "${RUNTIME_FILES[@]}"; do
-  cp "$SOURCE_DIR/$relative_path" "$RUNTIME_DIR/$relative_path"
+for relative_path in "${PACKAGE_FILES[@]}"; do
+  cp "$PACKAGE_SOURCE_DIR/$relative_path" "$PACKAGE_RUNTIME_DIR/$relative_path"
 done
 
 cp "$BRIDGE_SOURCE" "$RUNTIME_DIR/webbridge.py"
-cp "$VIEWER_SOURCE" "$RUNTIME_DIR/viewer.py"
+# The shim takes the place of dice/viewer.py, the module the matplotlib render
+# backend imports, so no browser path can reach matplotlib.
+cp "$VIEWER_SOURCE" "$PACKAGE_RUNTIME_DIR/viewer.py"
 
-cp -R "$SOURCE_DIR/stdlib/." "$RUNTIME_DIR/stdlib/"
+# `import "std:..."` resolves against stdlib/ next to interpreter.py.
+cp -R "$PACKAGE_SOURCE_DIR/stdlib/." "$PACKAGE_RUNTIME_DIR/stdlib/"
 cp -R "$SOURCE_DIR/examples/." "$RUNTIME_DIR/examples/"
 
 cd "$RUNTIME_DIR"

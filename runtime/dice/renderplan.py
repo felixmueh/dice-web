@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from diceengine import (
+from .diceengine import (
     ChartSpec,
     PanelWidthClass,
     RenderConfig,

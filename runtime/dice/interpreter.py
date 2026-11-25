@@ -12,9 +12,9 @@ import re
 import sys
 from itertools import product
 
-from diagnostics import DiagnosticError, DiagnosticWarning, RuntimeError as DiceRuntimeError
-from diceparser import DiceParser
-from lexer import (
+from .diagnostics import DiagnosticError, DiagnosticWarning, RuntimeError as DiceRuntimeError
+from .diceparser import DiceParser
+from .lexer import (
     Lexer,
     INTEGER,
     FLOAT,
@@ -46,7 +46,7 @@ from lexer import (
     PRINT,
     STRING,
 )
-from diceengine import (
+from .diceengine import (
     Sweep,
     SweepValues,
     FiniteMeasure,
@@ -66,8 +66,9 @@ from diceengine import (
     _union_axes,
     sweep_index,
 )
-from executor import ExactExecutor
-from executor import DiceDefault, MISSING, ParameterSpec, get_dicefunction_metadata, validate_runtime_value
+from .executor import ExactExecutor
+from .hostfunctions import DiceDefault, MISSING, ParameterSpec, get_dicefunction_metadata, validate_runtime_value
+from .purity import PurityAnalyzer
 
 
 STDLIB_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stdlib")
@@ -77,7 +78,16 @@ COMPLETION_KEYWORDS = ("as", "import", "in", "otherwise", "split")
 
 
 class CallableEntry(object):
-    def __init__(self, name, kind, parameters=(), variadic=False, function=None, node=None, sweep_mode=False):
+    def __init__(
+        self,
+        name,
+        kind,
+        parameters=(),
+        variadic=False,
+        function=None,
+        node=None,
+        sweep_mode=False,
+    ):
         self.name = name
         self.kind = kind
         self.parameters = tuple(parameters)
@@ -111,7 +121,8 @@ class Interpreter:
         self.stdlib_root = os.path.abspath(STDLIB_ROOT)
         self.imported_files = imported_files if imported_files is not None else set()
         self.import_stack = import_stack if import_stack is not None else []
-        self._sweep_cache = {}
+        self._function_cache = {}
+        self.purity_analyzer = PurityAnalyzer(self)
         self.output_callback = output_callback
         self.warnings = []
 
@@ -165,6 +176,43 @@ class Interpreter:
             )
         self.callable_scope[entry.name] = entry
 
+    def invalidate_caches(self):
+        self._function_cache.clear()
+        self.executor.invalidate_caches()
+        self.purity_analyzer.invalidate()
+
+    def _cache_key_component(self, value):
+        if isinstance(value, SweepValues):
+            # Current DSL memoization keys sweeps by their concrete bindings. That
+            # matches today's sweep identity semantics and keeps trivial unswept
+            # test values cacheable, but it should change once sweeps are keyed
+            # by label + domain instead.
+            return ("SweepValues", value.key, value.name, value.values)
+        if isinstance(value, Sweep):
+            return ("Sweep", value.axes, tuple((coordinates, self._cache_key_component(cell)) for coordinates, cell in value.items()))
+        if isinstance(value, Distribution):
+            return ("Distribution", value.entries)
+        if isinstance(value, FiniteMeasure):
+            return ("FiniteMeasure", value.entries)
+        if isinstance(value, TupleValue):
+            return ("TupleValue", tuple(self._cache_key_component(item) for item in value))
+        if isinstance(value, RecordValue):
+            return ("RecordValue", tuple((key, self._cache_key_component(entry_value)) for key, entry_value in value.items()))
+        try:
+            hash(value)
+        except TypeError:
+            return MISSING
+        return value
+
+    def _call_cache_key(self, entry, values):
+        components = []
+        for value in values:
+            component = self._cache_key_component(value)
+            if component is MISSING:
+                return None
+            components.append(component)
+        return (entry.name, tuple(components))
+
     def _identifier_names(self, node):
         names = set()
         if node is None:
@@ -216,6 +264,7 @@ class Interpreter:
                 node=node,
             )
         )
+        self.invalidate_caches()
 
     def register_function(self, function, name=None):
         metadata = get_dicefunction_metadata(function)
@@ -227,6 +276,7 @@ class Interpreter:
         if callable_name in self.callable_scope or callable_name in self.executor.functions:
             self.exception("Duplicate function definition for {}".format(callable_name))
         self.executor.register_function(function, name=callable_name)
+        self.invalidate_caches()
         return function
 
     def _node_span(self, node):
@@ -633,14 +683,24 @@ class Interpreter:
                 node=function,
                 hint="Rewrite the function using a closed-form expression or a builtin helper.",
             )
+        function_is_pure = self.purity_analyzer.function_is_pure(entry)
+        cache_key = None
+        if self.executor.supports_pure_function_caching and function_is_pure:
+            cache_key = self._call_cache_key(entry, values)
+            if cache_key is not None and cache_key in self._function_cache:
+                return self._function_cache[cache_key]
+
         local_scope = {parameter.name: value for parameter, value in zip(entry.parameters, values)}
         self.call_stack.append(entry.name)
         self.local_scopes.append(local_scope)
         try:
-            return self.visit(function.body)
+            result = self.visit(function.body)
         finally:
             self.local_scopes.pop()
             self.call_stack.pop()
+        if cache_key is not None:
+            self._function_cache[cache_key] = result
+        return result
 
     def _call_host_function(self, entry, values):
         if entry.variadic and getattr(entry, "variadic_keyword_arguments", False):
@@ -749,6 +809,7 @@ class Interpreter:
             if resolved_path.endswith(".py"):
                 module = self._load_imported_python_module(resolved_path)
                 self._import_python_exports(module, node)
+                self.invalidate_caches()
                 return None
             ast = self._parse_imported_source(resolved_path)
             return self.evaluate(ast)
@@ -875,7 +936,12 @@ class Interpreter:
                                 if remaining_mass == 0:
                                     continue
                                 result_distrib = result_value.lookup(clause_axes, coordinates)
-                                weighted = FiniteMeasure(
+                                # Keep raw weighted entries here instead of
+                                # constructing a temporary FiniteMeasure. Split
+                                # dominated workloads such as Chaos Bolt were
+                                # spending most of their time canonicalizing
+                                # these branch-local intermediates.
+                                weighted = tuple(
                                     (result_outcome, outcome_probability * remaining_mass * result_probability)
                                     for result_outcome, result_probability in result_distrib.items()
                                 )
@@ -902,7 +968,10 @@ class Interpreter:
                             matched_mass = remaining_mass * true_mass
                             if matched_mass:
                                 result_distrib = result_value.lookup(clause_axes, coordinates)
-                                clause_cells[coordinates] = FiniteMeasure(
+                                # This mirrors the otherwise-branch optimization
+                                # above: defer canonicalization until the final
+                                # branch contributions are merged.
+                                clause_cells[coordinates] = tuple(
                                     (result_outcome, outcome_probability * matched_mass * result_probability)
                                     for result_outcome, result_probability in result_distrib.items()
                                 )
@@ -978,7 +1047,10 @@ class Interpreter:
         if node.op.type == RES:
             return self._with_runtime_context(node, lambda: self.executor.res(self.visit(node.left), self.visit(node.right)))
         if node.op.type == ASSIGN:
+            # Parser invariant: top-level assignments parse as BinOp(ASSIGN),
+            # while function-body assignments parse as LocalAssign.
             self.global_scope[node.left.value] = self.visit(node.right)
+            self.invalidate_caches()
             return None
         self.exception("{} not implemented".format(node), node=node)
 

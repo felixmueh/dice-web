@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import json
 
-from diceengine import RenderConfig
-from renderplan import RenderOutcome, build_chart_plan, build_report_plan
-from resultjson import serialize_result
+from .diceengine import RenderConfig
+from .renderplan import RenderOutcome, build_chart_plan, build_report_plan
+from .resultjson import serialize_result
 
 
 _SINGLE_RESULT_PLAN_KINDS = {

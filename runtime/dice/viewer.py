@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
-"""Browser-safe viewer shim for dice-web."""
+"""Browser-safe viewer shim for dice-web.
+
+scripts/sync-runtime.sh installs this file as runtime/dice/viewer.py in place of
+dice's matplotlib viewer, so it imports its siblings relatively.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from diceengine import RenderConfig, _coerce_to_distributions
+from .diceengine import RenderConfig, _coerce_to_distributions
 
 
 @dataclass(frozen=True)

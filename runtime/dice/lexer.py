@@ -7,7 +7,7 @@ Is used to convert string input into a token stream"""
 
 import re
 
-from diagnostics import DEFAULT_SOURCE_NAME, LexerError, SourceDocument, SourceSpan
+from .diagnostics import DEFAULT_SOURCE_NAME, LexerError, SourceDocument, SourceSpan
 
 # Tokens
 INTEGER = "INTEGER"                      # integer number

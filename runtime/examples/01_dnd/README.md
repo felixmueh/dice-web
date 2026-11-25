@@ -1,6 +1,6 @@
 # D&D Examples
 
-These are substantial user-facing example programs built on `stdlib/dnd`.
+These are substantial user-facing example programs built on `dice/stdlib/dnd`.
 
 They are intentionally not forced into a tutorial order. Treat them as a library of worked examples.
 

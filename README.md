@@ -8,8 +8,12 @@ Static browser playground for the `dice` language. The site runs the runtime in 
   Git submodule with the source runtime.
 - `webbridge.py`
   Repo-local adapter exposing the stable browser-facing API over the vendored runtime.
+- `viewer.py`
+  Browser-safe stand-in for dice's matplotlib `dice/viewer.py`; the sync script installs it as `runtime/dice/viewer.py`.
 - `runtime/`
-  Copied browser runtime files served statically by the site.
+  Copied browser runtime files served statically by the site: the `dice`
+  package from the submodule (`runtime/dice/`, with `viewer.py` replaced by the
+  repo-local shim), `webbridge.py`, and the bundled `examples/`.
 - `src/`
   Browser app and worker.
 - `styles/`

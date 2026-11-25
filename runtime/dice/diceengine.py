@@ -13,24 +13,19 @@ import random
 import re
 from typing import Any, Generic, TypeVar
 
-from diagnostics import RuntimeError as DiceRuntimeError
-
-try:
-    from math import comb
-except ImportError:
-    from math import factorial
-
-    def comb(n, k):
-        return factorial(n) / factorial(k) / factorial(n - k)
+from .diagnostics import RuntimeError as DiceRuntimeError
+from .hostfunctions import dicefunction
 
 
 TRUE = 1
 FALSE = 0
 PROBABILITY_TOLERANCE = 1e-9
 _renderer_modules = {}
+# Renderer backends are sibling modules of this package, imported lazily so the
+# json backend (and dice-web, which replaces viewer.py) never imports matplotlib.
 _RENDERER_MODULE_NAMES = {
-    "matplotlib": "viewer",
-    "json": "jsonrenderer",
+    "matplotlib": ".viewer",
+    "json": ".jsonrenderer",
 }
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _OMITTED = object()
@@ -174,7 +169,7 @@ def _get_renderer(render_config=None):
     backend = _normalize_render_backend(render_config.backend)
     renderer = _renderer_modules.get(backend)
     if renderer is None:
-        renderer = importlib.import_module(_RENDERER_MODULE_NAMES[backend])
+        renderer = importlib.import_module(_RENDERER_MODULE_NAMES[backend], __package__)
         _renderer_modules[backend] = renderer
     return renderer
 
@@ -188,7 +183,6 @@ def wait_for_rendered_figures(render_config=None):
 
 def _canonicalize_weighted_entries(entries):
     merged = {}
-    order = []
     for outcome, weight in entries:
         if not isinstance(weight, (int, float)) or not isfinite(weight):
             runtime_error("weights must be finite numbers")
@@ -197,13 +191,10 @@ def _canonicalize_weighted_entries(entries):
         if weight == 0:
             continue
         try:
-            existing = merged.get(outcome, 0.0)
+            merged[outcome] = merged.get(outcome, 0.0) + float(weight)
         except TypeError as error:
             runtime_error("measure outcomes must be hashable: {}".format(error))
-        if outcome not in merged:
-            order.append(outcome)
-        merged[outcome] = existing + float(weight)
-    return tuple((outcome, merged[outcome]) for outcome in order if merged[outcome] != 0)
+    return tuple((outcome, weight) for outcome, weight in merged.items() if weight != 0)
 
 
 def _is_identifier_key(key):
@@ -803,26 +794,64 @@ def _uniform_die_distribution(sides):
     return Distribution(((outcome, 1.0 / sides) for outcome in range(1, sides + 1)))
 
 
-def _roll_plain(n, s):
-    _require_int(n, "roll")
-    _require_int(s, "roll")
-    if n < 0 or s <= 0:
-        runtime_error(
-            "roll expects positive sides and a non-negative dice count",
-            hint="Examples: 2d6, 1d20, or 0d6.",
-        )
-    if n == 0:
-        return _deterministic_distribution(0)
+DENSE_INTEGER_SUPPORT_RATIO = 8
+DENSE_INTEGER_SUPPORT_MIN_SPAN = 256
+_COMPARISON_NOT_DETERMINISTIC = object()
 
-    results = []
-    for p in range(1, s * n + 1):
-        c = (p - n) // s
-        probability = sum(
-            [(-1) ** k * comb(n, k) * comb(p - s * k - 1, n - 1) for k in range(0, c + 1)]
-        ) / s ** n
-        if probability != 0:
-            results.append((p, probability))
-    return Distribution(results)
+
+def _dense_integer_weights(distrib):
+    # Dense integer convolution is worthwhile for many combat distributions even
+    # when the support has holes, e.g. {0} U [hit_min..hit_max]. We therefore
+    # allow zero-filled gaps and gate the fast path by span/density instead of a
+    # strict contiguity check.
+    items = distrib.items()
+    if not items:
+        return None
+    weights_by_outcome = {}
+    start = None
+    end = None
+    for outcome, weight in items:
+        if not isinstance(outcome, int):
+            return None
+        weights_by_outcome[outcome] = weight
+        start = outcome if start is None else min(start, outcome)
+        end = outcome if end is None else max(end, outcome)
+    span = end - start + 1
+    nonzero_count = len(weights_by_outcome)
+    if span > max(nonzero_count * DENSE_INTEGER_SUPPORT_RATIO, DENSE_INTEGER_SUPPORT_MIN_SPAN):
+        return None
+    dense_weights = [0.0] * span
+    for outcome, weight in weights_by_outcome.items():
+        dense_weights[outcome - start] = weight
+    return start, tuple(dense_weights)
+
+
+def _convolve_dense_integer_add(left, right):
+    # This is the main exact-add fast path. It intentionally handles bounded
+    # integer supports with holes because branch-heavy attack distributions often
+    # have a miss spike at 0 plus dense positive damage bands.
+    left_dense = _dense_integer_weights(left)
+    if left_dense is None:
+        return None
+    right_dense = _dense_integer_weights(right)
+    if right_dense is None:
+        return None
+    left_start, left_weights = left_dense
+    right_start, right_weights = right_dense
+    result_weights = [0.0] * (len(left_weights) + len(right_weights) - 1)
+    for left_index, left_probability in enumerate(left_weights):
+        if left_probability == 0:
+            continue
+        for right_index, right_probability in enumerate(right_weights):
+            if right_probability == 0:
+                continue
+            result_weights[left_index + right_index] += left_probability * right_probability
+    start = left_start + right_start
+    return Distribution(
+        (start + index, probability)
+        for index, probability in enumerate(result_weights)
+        if probability != 0
+    )
 
 
 def _distribution_support_transform(value, scalar, operator, opname):
@@ -837,6 +866,13 @@ def _require_support_numeric(outcome, opname):
 
 
 def _pairwise_numeric(left, right, operator, opname):
+    if opname == "add":
+        # Try the dense integer path before falling back to generic pairwise
+        # combination. Future regressions here show up immediately in the exact
+        # combat benchmarks.
+        convolved = _convolve_dense_integer_add(left, right)
+        if convolved is not None:
+            return convolved
     result = []
     for left_value, left_probability in left.items():
         _require_numeric(left_value, opname)
@@ -894,6 +930,87 @@ def _compare_plain(left, right, operator):
     return Distribution(result)
 
 
+def _deterministic_comparison_value(value):
+    if isinstance(value, FiniteMeasure):
+        if not isinstance(value, Distribution):
+            runtime_error(
+                "comparisons do not support finite measures directly",
+                hint="Normalize the measure with d{...} first or compare against a scalar.",
+            )
+        items = value.items()
+        if len(items) == 1:
+            outcome, probability = items[0]
+            if abs(probability - 1.0) <= PROBABILITY_TOLERANCE:
+                return outcome
+        return _COMPARISON_NOT_DETERMINISTIC
+    return value
+
+
+def _compare_distribution_to_scalar(distribution, scalar, operator, *, scalar_on_left=False):
+    # Threshold-style combat queries such as d20 >= ac are common and do not
+    # need a full Cartesian product when one side is deterministic.
+    if _is_structured_value(scalar):
+        runtime_error(
+            "comparisons do not support tuple or record values yet",
+            hint="Use tuples and records as data values for now, not with comparison operators.",
+        )
+    true_probability = 0.0
+    for outcome, probability in distribution.items():
+        if _is_structured_value(outcome):
+            runtime_error(
+                "comparisons do not support tuple or record values yet",
+                hint="Use tuples and records as data values for now, not with comparison operators.",
+            )
+        left_value = scalar if scalar_on_left else outcome
+        right_value = outcome if scalar_on_left else scalar
+        comparison_true = False
+        if operator == "<=":
+            comparison_true = left_value <= right_value
+        elif operator == ">=":
+            comparison_true = left_value >= right_value
+        elif operator == "<":
+            comparison_true = left_value < right_value
+        elif operator == ">":
+            comparison_true = left_value > right_value
+        elif operator == "==":
+            comparison_true = left_value == right_value
+        if comparison_true:
+            true_probability += probability
+    if true_probability < 0 and abs(true_probability) <= PROBABILITY_TOLERANCE:
+        true_probability = 0.0
+    if true_probability > 1.0 and abs(true_probability - 1.0) <= PROBABILITY_TOLERANCE:
+        true_probability = 1.0
+    return Distribution(((TRUE, true_probability), (FALSE, 1.0 - true_probability)))
+
+
+def _compare_cell(left, right, operator):
+    def compare_values(left_value, right_value):
+        if _is_structured_value(left_value) or _is_structured_value(right_value):
+            runtime_error(
+                "comparisons do not support tuple or record values yet",
+                hint="Use tuples and records as data values for now, not with comparison operators.",
+            )
+        if operator == "<=":
+            return left_value <= right_value
+        if operator == ">=":
+            return left_value >= right_value
+        if operator == "<":
+            return left_value < right_value
+        if operator == ">":
+            return left_value > right_value
+        return left_value == right_value
+
+    left_scalar = _deterministic_comparison_value(left)
+    right_scalar = _deterministic_comparison_value(right)
+    if left_scalar is not _COMPARISON_NOT_DETERMINISTIC:
+        if right_scalar is not _COMPARISON_NOT_DETERMINISTIC:
+            return _deterministic_distribution(TRUE if compare_values(left_scalar, right_scalar) else FALSE)
+        return _compare_distribution_to_scalar(_coerce_to_distribution_cell(right), left_scalar, operator, scalar_on_left=True)
+    if right_scalar is not _COMPARISON_NOT_DETERMINISTIC:
+        return _compare_distribution_to_scalar(_coerce_to_distribution_cell(left), right_scalar, operator)
+    return _compare_plain(_coerce_to_distribution_cell(left), _coerce_to_distribution_cell(right), operator)
+
+
 def _member_cell(left, right):
     left_distribution = _coerce_to_distribution_cell(left)
     domain = _coerce_to_measure_cell(right)
@@ -931,14 +1048,18 @@ def _accumulate_distribution_contributions(contributions):
     combined_axes = _union_axes([Sweep(axes, cells) for axes, cells in contributions])
     cells = {}
     for coordinates in _coordinates_space(combined_axes):
-        entries = []
+        merged = {}
         for axes, contribution_cells in contributions:
             projected = _lookup_projected(axes, contribution_cells, combined_axes, coordinates, None)
             if projected is None:
                 continue
-            for outcome, probability in projected.items():
-                entries.append((outcome, probability))
-        cells[coordinates] = Distribution(entries)
+            # Split-heavy workloads keep raw weighted-entry tuples here on
+            # purpose so branch handling canonicalizes only once when the final
+            # Distribution is assembled for this output cell.
+            projected_entries = projected.items() if isinstance(projected, FiniteMeasure) else projected
+            for outcome, probability in projected_entries:
+                merged[outcome] = merged.get(outcome, 0.0) + probability
+        cells[coordinates] = Distribution(merged)
     return Sweep(combined_axes, cells)
 
 
@@ -1251,144 +1372,140 @@ def choose_single(left, right):
     return member(left, right)
 
 
-def res(condition, distrib):
+@dicefunction(pure=True)
+def res(condition: Any, distrib: Any):
     return reselse(condition, distrib, 0)
 
 
-def mean(value):
-    return _lift_cellwise(lambda cell: _deterministic_distribution(_coerce_to_distribution_cell(cell).average()), value)
+@dicefunction(pure=True)
+def mean(value: Any):
+    return _deterministic_distribution(_coerce_to_distribution_cell(value).average())
 
 
-def var(value):
-    return _lift_cellwise(lambda cell: _deterministic_distribution(_coerce_to_distribution_cell(cell).variance()), value)
+@dicefunction(pure=True)
+def var(value: Any):
+    return _deterministic_distribution(_coerce_to_distribution_cell(value).variance())
 
 
-def std(value):
-    return _lift_cellwise(lambda cell: _deterministic_distribution(_coerce_to_distribution_cell(cell).stddev()), value)
+@dicefunction(pure=True)
+def std(value: Any):
+    return _deterministic_distribution(_coerce_to_distribution_cell(value).stddev())
 
 
-def sample(value):
-    return _lift_cellwise(lambda cell: _sample_from_distribution(_coerce_to_distribution_cell(cell)), value)
+@dicefunction
+def sample(value: Any):
+    return _sample_from_distribution(_coerce_to_distribution_cell(value))
 
 
-def cum(value):
-    def apply(cell):
-        distrib = _coerce_to_distribution_cell(cell)
-        cumulative = 0.0
-        entries = []
-        for outcome in _ordered_numeric_outcomes(distrib, "cum"):
-            cumulative += distrib[outcome]
-            if abs(cumulative - 1.0) <= PROBABILITY_TOLERANCE:
-                cumulative = 1.0
-            entries.append((outcome, cumulative))
-        return FiniteMeasure(entries)
-
-    return _lift_cellwise(apply, value)
+@dicefunction(pure=True)
+def cum(value: Any):
+    distrib = _coerce_to_distribution_cell(value)
+    cumulative = 0.0
+    entries = []
+    for outcome in _ordered_numeric_outcomes(distrib, "cum"):
+        cumulative += distrib[outcome]
+        if abs(cumulative - 1.0) <= PROBABILITY_TOLERANCE:
+            cumulative = 1.0
+        entries.append((outcome, cumulative))
+    return FiniteMeasure(entries)
 
 
-def surv(value):
-    def apply(cell):
-        distrib = _coerce_to_distribution_cell(cell)
-        remaining = distrib.total_weight
-        entries = []
-        for outcome in _ordered_numeric_outcomes(distrib, "surv"):
-            remaining -= distrib[outcome]
-            if abs(remaining) <= PROBABILITY_TOLERANCE:
-                remaining = 0.0
-            entries.append((outcome, remaining))
-        return FiniteMeasure(entries)
-
-    return _lift_cellwise(apply, value)
+@dicefunction(pure=True)
+def surv(value: Any):
+    distrib = _coerce_to_distribution_cell(value)
+    remaining = distrib.total_weight
+    entries = []
+    for outcome in _ordered_numeric_outcomes(distrib, "surv"):
+        remaining -= distrib[outcome]
+        if abs(remaining) <= PROBABILITY_TOLERANCE:
+            remaining = 0.0
+        entries.append((outcome, remaining))
+    return FiniteMeasure(entries)
 
 
-def reselse(condition, distrib_if, distrib_else):
-    def apply(condition_cell, if_cell, else_cell):
-        condition_distribution = _coerce_to_distribution_cell(condition_cell)
-        true_mass, false_mass = _bool_mass(condition_distribution)
-        if_distribution = _coerce_to_distribution_cell(if_cell)
-        else_distribution = _coerce_to_distribution_cell(else_cell)
-        entries = []
-        for outcome, probability in if_distribution.items():
-            entries.append((outcome, true_mass * probability))
-        for outcome, probability in else_distribution.items():
-            entries.append((outcome, false_mass * probability))
-        return Distribution(entries)
-
-    return _lift_cellwise(apply, condition, distrib_if, distrib_else)
+@dicefunction(pure=True)
+def reselse(condition: Any, distrib_if: Any, distrib_else: Any):
+    condition_distribution = _coerce_to_distribution_cell(condition)
+    true_mass, false_mass = _bool_mass(condition_distribution)
+    if_distribution = _coerce_to_distribution_cell(distrib_if)
+    else_distribution = _coerce_to_distribution_cell(distrib_else)
+    entries = []
+    for outcome, probability in if_distribution.items():
+        entries.append((outcome, true_mass * probability))
+    for outcome, probability in else_distribution.items():
+        entries.append((outcome, false_mass * probability))
+    return Distribution(entries)
 
 
-def reselsediv(condition, distrib):
+@dicefunction(pure=True)
+def reselsediv(condition: Any, distrib: Any):
     return reselse(condition, distrib, div(distrib, 2))
 
 
-def reselsefloordiv(condition, distrib):
+@dicefunction(pure=True)
+def reselsefloordiv(condition: Any, distrib: Any):
     return reselse(condition, distrib, floordiv(distrib, 2))
 
 
-def roll(n, s):
-    def apply(n_cell, s_cell):
-        n_distribution = _coerce_to_distribution_cell(n_cell)
-        s_distribution = _coerce_to_distribution_cell(s_cell)
-        entries = []
-        for dice_count, dice_count_probability in n_distribution.items():
-            _require_int(dice_count, "roll")
-            for sides, sides_probability in s_distribution.items():
-                _require_int(sides, "roll")
-                rolled = _roll_plain(dice_count, sides)
-                outer = dice_count_probability * sides_probability
-                for outcome, probability in rolled.items():
-                    entries.append((outcome, outer * probability))
-        return Distribution(entries)
-
-    return _lift_cellwise(apply, n, s)
-
-
-def rollsingle(dice):
-    def apply(cell):
-        if isinstance(cell, FiniteMeasure) and not isinstance(cell, Distribution):
-            return _normalize_measure_cell(cell)
-        sides_distribution = _coerce_to_distribution_cell(cell)
-        entries = []
-        for sides, probability in sides_distribution.items():
+@dicefunction(pure=True)
+def roll(n: Any, s: Any):
+    n_distribution = _coerce_to_distribution_cell(n)
+    s_distribution = _coerce_to_distribution_cell(s)
+    entries = []
+    for dice_count, dice_count_probability in n_distribution.items():
+        _require_int(dice_count, "roll")
+        for sides, sides_probability in s_distribution.items():
             _require_int(sides, "roll")
-            die_distribution = _uniform_die_distribution(sides)
-            for outcome, inner_probability in die_distribution.items():
-                entries.append((outcome, probability * inner_probability))
-        return Distribution(entries)
-
-    return _lift_cellwise(apply, dice)
-
-
-def rolladvantage(dice):
-    def apply(cell):
-        dice_distribution = _coerce_to_distribution_cell(cell)
-        entries = []
-        for dice_sides, dice_probability in dice_distribution.items():
-            _require_int(dice_sides, "advantage")
-            if dice_sides <= 0:
-                runtime_error("can't roll advantage with non-positive dice sides")
-            for outcome in range(1, dice_sides + 1):
-                probability = 2 / dice_sides ** 2 * (outcome - 1) + (1 / dice_sides) ** 2
-                entries.append((outcome, dice_probability * probability))
-        return Distribution(entries)
-
-    return _lift_cellwise(apply, dice)
+            # Lower exact NdS into repeat_sum(single_die) so the same cached
+            # exact-add machinery is exercised by both explicit repeat_sum(...)
+            # and ordinary dice syntax.
+            rolled = _coerce_to_distribution_cell(repeat_sum(dice_count, rollsingle(sides)))
+            outer = dice_count_probability * sides_probability
+            for outcome, probability in rolled.items():
+                entries.append((outcome, outer * probability))
+    return Distribution(entries)
 
 
-def rolldisadvantage(dice):
-    def apply(cell):
-        dice_distribution = _coerce_to_distribution_cell(cell)
-        entries = []
-        for dice_sides, dice_probability in dice_distribution.items():
-            _require_int(dice_sides, "disadvantage")
-            if dice_sides <= 0:
-                runtime_error("can't roll disadvantage with non-positive dice sides")
-            for outcome in range(1, dice_sides + 1):
-                probability = 2 / dice_sides ** 2 * (dice_sides - outcome) + (1 / dice_sides) ** 2
-                entries.append((outcome, dice_probability * probability))
-        return Distribution(entries)
+@dicefunction(pure=True)
+def rollsingle(dice: Any):
+    if isinstance(dice, FiniteMeasure) and not isinstance(dice, Distribution):
+        return _normalize_measure_cell(dice)
+    sides_distribution = _coerce_to_distribution_cell(dice)
+    entries = []
+    for sides, probability in sides_distribution.items():
+        _require_int(sides, "roll")
+        die_distribution = _uniform_die_distribution(sides)
+        for outcome, inner_probability in die_distribution.items():
+            entries.append((outcome, probability * inner_probability))
+    return Distribution(entries)
 
-    return _lift_cellwise(apply, dice)
+
+@dicefunction(pure=True)
+def rolladvantage(dice: Any):
+    dice_distribution = _coerce_to_distribution_cell(dice)
+    entries = []
+    for dice_sides, dice_probability in dice_distribution.items():
+        _require_int(dice_sides, "advantage")
+        if dice_sides <= 0:
+            runtime_error("can't roll advantage with non-positive dice sides")
+        for outcome in range(1, dice_sides + 1):
+            probability = 2 / dice_sides ** 2 * (outcome - 1) + (1 / dice_sides) ** 2
+            entries.append((outcome, dice_probability * probability))
+    return Distribution(entries)
+
+
+@dicefunction(pure=True)
+def rolldisadvantage(dice: Any):
+    dice_distribution = _coerce_to_distribution_cell(dice)
+    entries = []
+    for dice_sides, dice_probability in dice_distribution.items():
+        _require_int(dice_sides, "disadvantage")
+        if dice_sides <= 0:
+            runtime_error("can't roll disadvantage with non-positive dice sides")
+        for outcome in range(1, dice_sides + 1):
+            probability = 2 / dice_sides ** 2 * (dice_sides - outcome) + (1 / dice_sides) ** 2
+            entries.append((outcome, dice_probability * probability))
+    return Distribution(entries)
 
 
 def _rollhigh_plain(n, s, nh):
@@ -1441,127 +1558,130 @@ def _rolllow_plain(n, s, nl):
     return Distribution(((outcome, weight / total) for outcome, weight in counts.items()))
 
 
-def rollhigh(n, s, nh):
-    def apply(n_cell, s_cell, keep_cell):
-        n_distribution = _coerce_to_distribution_cell(n_cell)
-        s_distribution = _coerce_to_distribution_cell(s_cell)
-        keep_distribution = _coerce_to_distribution_cell(keep_cell)
-        entries = []
-        for dice_count, dice_count_probability in n_distribution.items():
-            for sides, sides_probability in s_distribution.items():
-                for keep_count, keep_probability in keep_distribution.items():
-                    rolled = _rollhigh_plain(dice_count, sides, keep_count)
-                    outer = dice_count_probability * sides_probability * keep_probability
-                    for outcome, probability in rolled.items():
-                        entries.append((outcome, outer * probability))
-        return Distribution(entries)
-
-    return _lift_cellwise(apply, n, s, nh)
+@dicefunction(pure=True)
+def rollhigh(n: Any, s: Any, nh: Any):
+    n_distribution = _coerce_to_distribution_cell(n)
+    s_distribution = _coerce_to_distribution_cell(s)
+    keep_distribution = _coerce_to_distribution_cell(nh)
+    entries = []
+    for dice_count, dice_count_probability in n_distribution.items():
+        for sides, sides_probability in s_distribution.items():
+            for keep_count, keep_probability in keep_distribution.items():
+                rolled = _rollhigh_plain(dice_count, sides, keep_count)
+                outer = dice_count_probability * sides_probability * keep_probability
+                for outcome, probability in rolled.items():
+                    entries.append((outcome, outer * probability))
+    return Distribution(entries)
 
 
-def rolllow(n, s, nl):
-    def apply(n_cell, s_cell, keep_cell):
-        n_distribution = _coerce_to_distribution_cell(n_cell)
-        s_distribution = _coerce_to_distribution_cell(s_cell)
-        keep_distribution = _coerce_to_distribution_cell(keep_cell)
-        entries = []
-        for dice_count, dice_count_probability in n_distribution.items():
-            for sides, sides_probability in s_distribution.items():
-                for keep_count, keep_probability in keep_distribution.items():
-                    rolled = _rolllow_plain(dice_count, sides, keep_count)
-                    outer = dice_count_probability * sides_probability * keep_probability
-                    for outcome, probability in rolled.items():
-                        entries.append((outcome, outer * probability))
-        return Distribution(entries)
-
-    return _lift_cellwise(apply, n, s, nl)
+@dicefunction(pure=True)
+def rolllow(n: Any, s: Any, nl: Any):
+    n_distribution = _coerce_to_distribution_cell(n)
+    s_distribution = _coerce_to_distribution_cell(s)
+    keep_distribution = _coerce_to_distribution_cell(nl)
+    entries = []
+    for dice_count, dice_count_probability in n_distribution.items():
+        for sides, sides_probability in s_distribution.items():
+            for keep_count, keep_probability in keep_distribution.items():
+                rolled = _rolllow_plain(dice_count, sides, keep_count)
+                outer = dice_count_probability * sides_probability * keep_probability
+                for outcome, probability in rolled.items():
+                    entries.append((outcome, outer * probability))
+    return Distribution(entries)
 
 
-def add(left, right):
-    return _lift_cellwise(lambda a, b: _numeric_binary_cell(a, b, lambda x, y: x + y, "add"), left, right)
+@dicefunction(pure=True)
+def add(left: Any, right: Any):
+    return _numeric_binary_cell(left, right, lambda x, y: x + y, "add")
 
 
-def sub(left, right):
-    return _lift_cellwise(lambda a, b: _numeric_binary_cell(a, b, lambda x, y: x - y, "sub"), left, right)
+@dicefunction(pure=True)
+def sub(left: Any, right: Any):
+    return _numeric_binary_cell(left, right, lambda x, y: x - y, "sub")
 
 
-def mul(left, right):
-    return _lift_cellwise(lambda a, b: _numeric_binary_cell(a, b, lambda x, y: x * y, "mul"), left, right)
+@dicefunction(pure=True)
+def mul(left: Any, right: Any):
+    return _numeric_binary_cell(left, right, lambda x, y: x * y, "mul")
 
 
-def div(left, right):
+@dicefunction(pure=True)
+def div(left: Any, right: Any):
     def op(x, y):
         if y == 0:
             runtime_error("can't divide by zero")
         return x / y
 
-    return _lift_cellwise(lambda a, b: _numeric_binary_cell(a, b, op, "div"), left, right)
+    return _numeric_binary_cell(left, right, op, "div")
 
 
-def floordiv(left, right):
+@dicefunction(pure=True)
+def floordiv(left: Any, right: Any):
     def op(x, y):
         if y == 0:
             runtime_error("can't divide by zero")
         return x // y
 
-    return _lift_cellwise(lambda a, b: _numeric_binary_cell(a, b, op, "floordiv"), left, right)
+    return _numeric_binary_cell(left, right, op, "floordiv")
 
 
-def neg(value):
+@dicefunction(pure=True)
+def neg(value: Any):
     return mul(-1, value)
 
 
-def greaterorequal(left, right):
-    return _lift_cellwise(lambda a, b: _compare_plain(_coerce_to_distribution_cell(a), _coerce_to_distribution_cell(b), ">="), left, right)
+@dicefunction(pure=True)
+def greaterorequal(left: Any, right: Any):
+    return _compare_cell(left, right, ">=")
 
 
-def greater(left, right):
-    return _lift_cellwise(lambda a, b: _compare_plain(_coerce_to_distribution_cell(a), _coerce_to_distribution_cell(b), ">"), left, right)
+@dicefunction(pure=True)
+def greater(left: Any, right: Any):
+    return _compare_cell(left, right, ">")
 
 
-def equal(left, right):
-    return _lift_cellwise(lambda a, b: _compare_plain(_coerce_to_distribution_cell(a), _coerce_to_distribution_cell(b), "=="), left, right)
+@dicefunction(pure=True)
+def equal(left: Any, right: Any):
+    return _compare_cell(left, right, "==")
 
 
-def lessorequal(left, right):
-    return _lift_cellwise(lambda a, b: _compare_plain(_coerce_to_distribution_cell(a), _coerce_to_distribution_cell(b), "<="), left, right)
+@dicefunction(pure=True)
+def lessorequal(left: Any, right: Any):
+    return _compare_cell(left, right, "<=")
 
 
-def less(left, right):
-    return _lift_cellwise(lambda a, b: _compare_plain(_coerce_to_distribution_cell(a), _coerce_to_distribution_cell(b), "<"), left, right)
+@dicefunction(pure=True)
+def less(left: Any, right: Any):
+    return _compare_cell(left, right, "<")
 
 
-def member(left, right):
-    return _lift_cellwise(_member_cell, left, right)
+@dicefunction(pure=True)
+def member(left: Any, right: Any):
+    return _member_cell(left, right)
 
 
-def repeat_sum_with(add_function, count, value):
-    count_sweep = _coerce_value_to_sweep(count)
-    contributions = []
-    for count_coordinates, count_cell in count_sweep.items():
-        count_outcome = _deterministic_numeric_value(count_cell, "repeat_sum", allow_float=False)
-        if count_outcome < 0:
-            runtime_error(
-                "repeat_sum expects a non-negative integer count",
-                hint="Use 0 or a positive integer count.",
-            )
-        repeated = 0
-        for _ in range(count_outcome):
-            repeated = add_function(repeated, value)
-        repeated_sweep = _coerce_value_to_sweep(repeated)
-        count_selection = _fixed_axis_distribution(count_sweep.axes, count_coordinates)
-        combined_axes = _union_axes([count_selection, repeated_sweep])
-        cells = {}
-        for coordinates in _coordinates_space(combined_axes):
-            if _lookup_projected(count_sweep.axes, {count_coordinates: 1}, combined_axes, coordinates, 0) != 1:
-                continue
-            cells[coordinates] = repeated_sweep.lookup(combined_axes, coordinates)
-        contributions.append((combined_axes, cells))
-    return Sweep(_union_axes([Sweep(axes, cells) for axes, cells in contributions]), {coord: value for axes, cells in contributions for coord, value in cells.items()}) if contributions else Sweep.scalar(0)
+@dicefunction(pure=True)
+def repeat_sum(count: Any, value: Any):
+    count_outcome = _deterministic_numeric_value(count, "repeat_sum", allow_float=False)
+    if count_outcome < 0:
+        runtime_error(
+            "repeat_sum expects a non-negative integer count",
+            hint="Use 0 or a positive integer count.",
+        )
+    if count_outcome == 0:
+        return 0
+    if count_outcome == 1:
+        return value
+    # Recurse through the decorated builtin itself so the per-function cache
+    # attached by @dicefunction(pure=True) is shared across the whole execution.
+    half = repeat_sum(count_outcome // 2, value)
+    doubled = add(half, half)
+    return doubled if count_outcome % 2 == 0 else add(doubled, value)
 
 
-def repeat_sum(count, value):
-    return repeat_sum_with(add, count, value)
+@dicefunction(pure=True)
+def sumover(value: Sweep[Any], axes=_OMITTED):
+    return sumover_with(add, value, axes)
 
 
 def sumover_with(add_function, value, axes=_OMITTED):
@@ -1584,18 +1704,15 @@ def _sumover_reduce_entries(add_function, entries):
         runtime_error("sumover reduction produced an unexpected sweep")
     return reduced_sweep.only_value()
 
-
-def sumover(value, axes=_OMITTED):
-    return sumover_with(add, value, axes)
-
-
-def meanover(value, axes=_OMITTED):
+@dicefunction(pure=True)
+def meanover(value: Sweep[Any], axes=_OMITTED):
     sweep = _coerce_value_to_sweep(value)
     targets = _resolve_reduction_targets(sweep, axes, "meanover")
     return _apply_reduction(sweep, targets, "meanover", lambda _targets, entries: _mean_reduce_cell(entries))
 
 
-def maxover(value, axes=_OMITTED):
+@dicefunction(pure=True)
+def maxover(value: Sweep[Any], axes=_OMITTED):
     sweep = _coerce_value_to_sweep(value)
     targets = _resolve_reduction_targets(sweep, axes, "maxover")
     return _apply_reduction(
@@ -1606,7 +1723,8 @@ def maxover(value, axes=_OMITTED):
     )
 
 
-def argmaxover(value, axes=_OMITTED):
+@dicefunction(pure=True)
+def argmaxover(value: Sweep[Any], axes=_OMITTED):
     sweep = _coerce_value_to_sweep(value)
     targets = _resolve_reduction_targets(sweep, axes, "argmaxover")
     return _apply_reduction(
@@ -1630,8 +1748,8 @@ def total_with(add_function, value):
         lambda _targets, entries: _sumover_reduce_entries(add_function, entries),
     )
 
-
-def total(value):
+@dicefunction(pure=True)
+def total(value: Sweep[Any]):
     return total_with(add, value)
 
 

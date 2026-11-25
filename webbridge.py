@@ -11,32 +11,36 @@ import tempfile
 
 
 def _ensure_dice_imports():
+    """Put the directory that contains the `dice` package on sys.path.
+
+    In the browser runtime the package is copied next to this file
+    (runtime/dice/); in a checkout it sits inside the dice submodule
+    (dice/dice/), next to this file or next to its parent directory.
+    """
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    if current_dir not in sys.path:
-        sys.path.insert(0, current_dir)
     candidates = [
+        current_dir,
         os.path.join(current_dir, "dice"),
         os.path.join(os.path.dirname(current_dir), "dice"),
-        current_dir,
     ]
     for candidate in candidates:
-        if os.path.isfile(os.path.join(candidate, "interpreter.py")):
+        if os.path.isfile(os.path.join(candidate, "dice", "interpreter.py")):
             if candidate not in sys.path:
-                sys.path.insert(1, candidate)
+                sys.path.insert(0, candidate)
             return candidate
-    raise ImportError("Could not locate dice runtime sources for webbridge")
+    raise ImportError("Could not locate the dice package for webbridge")
 
 
 _ensure_dice_imports()
 
-from diagnostics import DiagnosticError, format_diagnostic
-from diceengine import ChartSpec, Distribution, Distributions, FiniteMeasure, RenderConfig
-from diceparser import DiceParser, ParserError
-from executor import ExactExecutor
-from interpreter import COMPLETION_KEYWORDS, CallableEntry, Interpreter, STDLIB_ROOT
-from jsonrenderer import serialize_chart_plan
-from lexer import ASSIGN, Lexer, LexerError, SEMI
-from renderplan import build_chart_plan
+from dice.diagnostics import DiagnosticError, format_diagnostic
+from dice.diceengine import ChartSpec, Distribution, Distributions, FiniteMeasure, RenderConfig
+from dice.diceparser import DiceParser, ParserError
+from dice.executor import ExactExecutor
+from dice.interpreter import COMPLETION_KEYWORDS, CallableEntry, Interpreter, STDLIB_ROOT
+from dice.jsonrenderer import serialize_chart_plan
+from dice.lexer import ASSIGN, Lexer, LexerError, SEMI
+from dice.renderplan import build_chart_plan
 
 
 DEFAULT_SOURCE_PATH = "main.dice"
